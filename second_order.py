@@ -1,465 +1,993 @@
 """
 Second-Order Optimization Methods
-==================================
+===================================
+Pure-Python implementations of second-order and quasi-Newton optimization
+algorithms. No external dependencies — stdlib only (math, random, typing,
+warnings).
 
-Newton's method, Quasi-Newton methods (BFGS, L-BFGS), Conjugate Gradient.
+All matrix operations are performed on plain Python ``List[List[float]]``
+objects using private helper functions defined at the top of this module.
 
-Uses second-order information (Hessian) for faster convergence.
+Exported functions
+------------------
+* ``newton_raphson``       — Exact Newton with Cholesky solver + ridge fallback
+* ``bfgs``                 — Full BFGS with inverse Hessian update
+* ``lbfgs``                — Limited-memory BFGS (two-loop recursion)
+* ``sr1``                  — Symmetric Rank-1 quasi-Newton
+* ``gauss_newton``         — Gauss-Newton for nonlinear least squares
+* ``levenberg_marquardt``  — Levenberg-Marquardt damped least squares
+* ``trust_region``         — Trust-region with Steihaug CG subproblem
+* ``newton_cg``            — Truncated Newton (CG to solve Newton system)
+
+References
+----------
+* Nocedal & Wright (2006) — Numerical Optimization, 2nd ed.
+* Conn, Gould & Toint (2000) — Trust-Region Methods.
 """
 
 import math
-from collections import deque
-from typing import List, Callable, Tuple, Optional
+import warnings
+from typing import Callable, List, Optional, Tuple
+
+__all__ = [
+    'newton_raphson',
+    'bfgs',
+    'lbfgs',
+    'sr1',
+    'gauss_newton',
+    'levenberg_marquardt',
+    'trust_region',
+    'newton_cg',
+]
+
+# ---------------------------------------------------------------------------
+# Private matrix / linear-algebra helpers
+# ---------------------------------------------------------------------------
+
+def _dot(a: List[float], b: List[float]) -> float:
+    """Dot product of two vectors."""
+    return sum(ai * bi for ai, bi in zip(a, b))
 
 
-def newton_step(gradient: List[float], hessian: List[List[float]]) -> List[float]:
-    """
-    Compute Newton direction: direction = -H^(-1) * gradient
+def _mat_vec(A: List[List[float]], v: List[float]) -> List[float]:
+    """Matrix-vector product  A @ v."""
+    return [_dot(row, v) for row in A]
 
-    Uses Gaussian elimination with partial pivoting and Tikhonov regularisation
-    (diagonal damping λ = 1e-8) to handle near-singular or indefinite Hessians.
-    A RuntimeWarning is raised if the matrix is numerically singular so callers
-    can detect unreliable directions.
 
-    Args:
-        gradient: Gradient vector
-        hessian: Hessian matrix
+def _outer(a: List[float], b: List[float]) -> List[List[float]]:
+    """Outer product  a * b^T."""
+    return [[ai * bj for bj in b] for ai in a]
 
-    Returns:
-        Newton direction
-    """
-    import warnings
-    n = len(gradient)
 
-    # Copy inputs; apply small diagonal regularisation to improve conditioning.
-    REG = 1e-8
-    H = [row[:] for row in hessian]
+def _eye(n: int) -> List[List[float]]:
+    """n x n identity matrix."""
+    return [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+
+
+def _mat_add(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
+    """Element-wise matrix addition."""
+    n = len(A)
+    m = len(A[0])
+    return [[A[i][j] + B[i][j] for j in range(m)] for i in range(n)]
+
+
+def _mat_scale(A: List[List[float]], s: float) -> List[List[float]]:
+    """Scalar multiplication of a matrix."""
+    return [[A[i][j] * s for j in range(len(A[i]))] for i in range(len(A))]
+
+
+def _mat_mul(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
+    """Matrix-matrix product  A @ B."""
+    n = len(A)
+    m = len(B[0])
+    p = len(B)
+    C = [[0.0] * m for _ in range(n)]
     for i in range(n):
-        H[i][i] += REG
-    g = [-gi for gi in gradient]
+        for k in range(p):
+            if A[i][k] == 0.0:
+                continue
+            for j in range(m):
+                C[i][j] += A[i][k] * B[k][j]
+    return C
 
-    # Forward elimination with partial pivoting
+
+def _vec_add(a: List[float], b: List[float]) -> List[float]:
+    """Element-wise vector addition."""
+    return [ai + bi for ai, bi in zip(a, b)]
+
+
+def _vec_sub(a: List[float], b: List[float]) -> List[float]:
+    """Element-wise vector subtraction."""
+    return [ai - bi for ai, bi in zip(a, b)]
+
+
+def _vec_scale(a: List[float], s: float) -> List[float]:
+    """Scale vector by scalar."""
+    return [ai * s for ai in a]
+
+
+def _norm(v: List[float]) -> float:
+    """Euclidean norm of a vector."""
+    return math.sqrt(sum(vi * vi for vi in v))
+
+
+def _cholesky(A: List[List[float]]) -> List[List[float]]:
+    """Cholesky decomposition: return lower-triangular L such that A = L L^T.
+
+    Raises ValueError if A is not positive-definite.
+    """
+    n = len(A)
+    L = [[0.0] * n for _ in range(n)]
     for i in range(n):
-        # Find pivot
-        max_row = i
-        for k in range(i + 1, n):
-            if abs(H[k][i]) > abs(H[max_row][i]):
-                max_row = k
-        H[i], H[max_row] = H[max_row], H[i]
-        g[i], g[max_row] = g[max_row], g[i]
+        for j in range(i + 1):
+            s = A[i][j] - sum(L[i][k] * L[j][k] for k in range(j))
+            if i == j:
+                if s <= 0.0:
+                    raise ValueError(
+                        f"Matrix is not positive-definite (diagonal entry {s} at index {i})"
+                    )
+                L[i][j] = math.sqrt(s)
+            else:
+                L[i][j] = s / L[j][j]
+    return L
 
-        if abs(H[i][i]) < 1e-10:
-            # Column is numerically zero even after pivoting; skip elimination
-            # for this column but warn the caller.
-            warnings.warn(
-                f"newton_step: near-singular Hessian at pivot {i} "
-                "(direction component set to 0); result may be unreliable.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            # Explicitly zero the sub-diagonal entries of column i so that
-            # back-substitution sees a properly upper-triangular matrix.
-            # Without this, H[k][i] for k > i remain non-zero and corrupt
-            # the back-substitution sums for rows above i.
-            for k in range(i + 1, n):
-                H[k][i] = 0.0
-            continue
 
-        for k in range(i + 1, n):
-            factor = H[k][i] / H[i][i]
-            g[k] -= factor * g[i]
-            for j in range(i, n):
-                H[k][j] -= factor * H[i][j]
+def _chol_solve(L: List[List[float]], b: List[float]) -> List[float]:
+    """Solve the system A x = b given the Cholesky factor L (A = L L^T).
 
-    # Back substitution
-    direction = [0.0] * n
+    Uses forward substitution (L y = b) then back substitution (L^T x = y).
+    """
+    n = len(L)
+    # Forward substitution: L y = b
+    y = [0.0] * n
+    for i in range(n):
+        y[i] = (b[i] - sum(L[i][j] * y[j] for j in range(i))) / L[i][i]
+    # Back substitution: L^T x = y
+    x = [0.0] * n
     for i in range(n - 1, -1, -1):
-        if abs(H[i][i]) < 1e-10:
-            direction[i] = 0.0
+        x[i] = (y[i] - sum(L[j][i] * x[j] for j in range(i + 1, n))) / L[i][i]
+    return x
+
+
+def _lu_decompose(A: List[List[float]]) -> Tuple[List[List[float]], List[int]]:
+    """LU decomposition with partial pivoting.
+
+    Returns (LU, piv) where LU stores both L (strictly lower) and U (upper)
+    in-place, and piv is the pivot index array.
+    """
+    n = len(A)
+    # Work on a copy
+    M = [row[:] for row in A]
+    piv = list(range(n))
+    for k in range(n):
+        # Find pivot
+        max_val = abs(M[k][k])
+        max_row = k
+        for i in range(k + 1, n):
+            if abs(M[i][k]) > max_val:
+                max_val = abs(M[i][k])
+                max_row = i
+        if max_row != k:
+            M[k], M[max_row] = M[max_row], M[k]
+            piv[k], piv[max_row] = piv[max_row], piv[k]
+        if abs(M[k][k]) < 1e-15:
+            # Singular; leave as-is (caller handles)
+            continue
+        for i in range(k + 1, n):
+            factor = M[i][k] / M[k][k]
+            M[i][k] = factor  # store L below diagonal
+            for j in range(k + 1, n):
+                M[i][j] -= factor * M[k][j]
+    return M, piv
+
+
+def _lu_solve(LU: List[List[float]], piv: List[int], b: List[float]) -> List[float]:
+    """Solve A x = b given an LU factorisation with pivoting."""
+    n = len(LU)
+    # Apply permutation
+    pb = [b[piv[i]] for i in range(n)]
+    # Forward substitution: L y = pb (L has implicit 1s on diagonal)
+    y = [0.0] * n
+    for i in range(n):
+        y[i] = pb[i] - sum(LU[i][j] * y[j] for j in range(i))
+    # Back substitution: U x = y
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        if abs(LU[i][i]) < 1e-15:
+            x[i] = 0.0
         else:
-            direction[i] = (
-                g[i] - sum(H[i][j] * direction[j] for j in range(i + 1, n))
-            ) / H[i][i]
-
-    return direction
+            x[i] = (y[i] - sum(LU[i][j] * x[j] for j in range(i + 1, n))) / LU[i][i]
+    return x
 
 
-def _so_line_search(
+def _solve_linear(A: List[List[float]], b: List[float]) -> List[float]:
+    """Solve the linear system A x = b.
+
+    Tries Cholesky first (faster, requires PD); falls back to LU.
+    """
+    try:
+        L = _cholesky(A)
+        return _chol_solve(L, b)
+    except ValueError:
+        LU, piv = _lu_decompose(A)
+        return _lu_solve(LU, piv, b)
+
+
+# ---------------------------------------------------------------------------
+# Backtracking line search (Armijo condition) — used internally
+# ---------------------------------------------------------------------------
+
+def _backtracking(
     f: Callable[[List[float]], float],
     x: List[float],
-    direction: List[float],
-    grad: List[float],
-    rho: float = 0.9,
-    c: float = 1e-4,
-    max_iter: int = 20
+    d: List[float],
+    g: List[float],
+    alpha: float = 1.0,
+    rho: float = 0.5,
+    c1: float = 1e-4,
+    max_ls: int = 50,
 ) -> float:
-    """Backtracking Armijo line search shared by all second-order methods.
+    """Return step size satisfying the Armijo sufficient-decrease condition.
 
-    Uses rho=0.9 (slow shrinkage) because quasi-Newton / conjugate-gradient
-    search directions are well-scaled and alpha=1 is typically accepted on
-    the first or second try.  The public ``backtracking_line_search`` in
-    line_search.py uses rho=0.5 (faster shrinkage) for a more conservative
-    general-purpose default.
+    f(x + alpha*d) <= f(x) + c1 * alpha * grad^T d
     """
-    alpha = 1.0
-    gTd = sum(g * d for g, d in zip(grad, direction))
-    f_x = f(x)
-    for _ in range(max_iter):
-        x_new = [xi + alpha * di for xi, di in zip(x, direction)]
-        if f(x_new) <= f_x + c * alpha * gTd:
+    f0 = f(x)
+    slope = _dot(g, d)
+    for _ in range(max_ls):
+        x_new = _vec_add(x, _vec_scale(d, alpha))
+        if f(x_new) <= f0 + c1 * alpha * slope:
             return alpha
         alpha *= rho
     return alpha
 
 
-class NewtonMethod:
+# ---------------------------------------------------------------------------
+# 1. Newton-Raphson
+# ---------------------------------------------------------------------------
+
+def newton_raphson(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    hess_f: Callable[[List[float]], List[List[float]]],
+    x0: List[float],
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    alpha: float = 1.0,
+) -> Tuple[List[float], float, int, bool]:
+    """Pure Newton optimisation with exact Hessian.
+
+    Parameters
+    ----------
+    f:
+        Objective function ``f(x) -> float``.
+    grad_f:
+        Gradient function ``grad_f(x) -> List[float]``.
+    hess_f:
+        Hessian function ``hess_f(x) -> List[List[float]]``.
+    x0:
+        Initial point.
+    tol:
+        Convergence tolerance on gradient norm (default ``1e-6``).
+    max_iter:
+        Maximum number of Newton steps (default ``100``).
+    alpha:
+        Fixed step size multiplier (default ``1.0``).
+
+    Returns
+    -------
+    x_opt:
+        Approximate minimiser.
+    f_opt:
+        Objective value at ``x_opt``.
+    n_iters:
+        Number of iterations performed.
+    converged:
+        ``True`` if ``||grad|| < tol`` at termination.
+
+    Notes
+    -----
+    The Newton direction solves  H d = -g  via Cholesky factorisation when
+    the Hessian is positive-definite.  If Cholesky fails (H not PD), ridge
+    regularisation (λ I) is added and increased until the modified system is
+    solvable.
     """
-    Newton's Method for optimization.
+    x = x0[:]
+    n = len(x)
+    converged = False
+    n_iters = 0
 
-    Uses second-order Taylor approximation.
+    for _ in range(max_iter):
+        n_iters += 1
+        g = grad_f(x)
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
 
-    θ_new = θ - H^(-1) * ∇f(θ)
+        H = hess_f(x)
+        neg_g = [-gi for gi in g]
 
-    where H is the Hessian matrix.
-    """
-
-    def __init__(
-        self,
-        learning_rate: float = 1.0,
-        max_iter: int = 100,
-        tol: float = 1e-6
-    ):
-        self.learning_rate = learning_rate
-        self.max_iter = max_iter
-        self.tol = tol
-
-    def optimize(
-        self,
-        f: Callable[[List[float]], float],
-        grad_f: Callable[[List[float]], List[float]],
-        hess_f: Callable[[List[float]], List[List[float]]],
-        x0: List[float]
-    ) -> Tuple[List[float], List[float]]:
-        """
-        Minimize function using Newton's method.
-
-        Args:
-            f: Objective function
-            grad_f: Gradient function
-            hess_f: Hessian function
-            x0: Initial point
-
-        Returns:
-            (optimal_point, history_of_function_values)
-        """
-        x = x0[:]
-        history = [f(x)]
-
-        for iteration in range(self.max_iter):
-            grad = grad_f(x)
-
-            # Check convergence
-            grad_norm = math.sqrt(sum(g**2 for g in grad))
-            if grad_norm < self.tol:
+        # Try Cholesky; if H is not PD, add increasing ridge regularisation
+        lam = 0.0
+        d = None
+        for _r in range(50):
+            H_reg = [
+                [H[i][j] + (lam if i == j else 0.0) for j in range(n)]
+                for i in range(n)
+            ]
+            try:
+                L = _cholesky(H_reg)
+                d = _chol_solve(L, neg_g)
                 break
+            except ValueError:
+                lam = max(1e-6, lam * 10) if lam > 0 else 1e-6
 
-            # Compute Newton direction
-            hess = hess_f(x)
-            direction = newton_step(grad, hess)
+        if d is None:
+            warnings.warn("Newton-Raphson: could not find a descent direction; stopping.")
+            break
 
-            # Update
-            x = [xi + self.learning_rate * di for xi, di in zip(x, direction)]
-            history.append(f(x))
+        x = _vec_add(x, _vec_scale(d, alpha))
 
-        return x, history
-
-    def reset(self):
-        """No persistent state between optimize() calls; provided for API consistency."""
-        pass
+    return x, f(x), n_iters, converged
 
 
-class BFGS:
+# ---------------------------------------------------------------------------
+# 2. BFGS
+# ---------------------------------------------------------------------------
+
+def bfgs(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    x0: List[float],
+    tol: float = 1e-6,
+    max_iter: int = 200,
+    alpha0: float = 1.0,
+) -> Tuple[List[float], float, int, bool]:
+    """Full BFGS with inverse Hessian approximation.
+
+    Implements the standard BFGS update for the *inverse* Hessian H_k:
+
+    .. math::
+        H_{k+1} = (I - \\rho_k s_k y_k^T) H_k (I - \\rho_k y_k s_k^T)
+                  + \\rho_k s_k s_k^T
+
+    with  :math:`\\rho_k = 1 / y_k^T s_k`.
+
+    The search direction is  d_k = -H_k g_k  and the step size is found by
+    backtracking Armijo line search.
+
+    Parameters
+    ----------
+    f, grad_f, x0, tol, max_iter, alpha0:
+        See ``newton_raphson`` for common parameters.
+
+    Returns
+    -------
+    (x_opt, f_opt, n_iters, converged)
     """
-    Broyden-Fletcher-Goldfarb-Shanno (BFGS) algorithm.
+    n = len(x0)
+    x = x0[:]
+    g = grad_f(x)
+    H = _eye(n)  # inverse Hessian approximation
+    converged = False
 
-    Quasi-Newton method that approximates Hessian inverse.
+    for k in range(max_iter):
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
+
+        # Search direction
+        d = _mat_vec(H, [-gi for gi in g])
+
+        # Ensure descent direction
+        if _dot(d, g) >= 0:
+            d = [-gi for gi in g]  # fall back to steepest descent
+
+        # Backtracking line search (Armijo)
+        step = _backtracking(f, x, d, g, alpha=alpha0)
+
+        # Update x
+        x_new = _vec_add(x, _vec_scale(d, step))
+        g_new = grad_f(x_new)
+
+        s = _vec_sub(x_new, x)
+        y = _vec_sub(g_new, g)
+        sy = _dot(s, y)
+
+        # BFGS inverse Hessian update (skip if curvature condition fails)
+        if sy > 1e-10:
+            rho = 1.0 / sy
+            # H_{k+1} = (I - rho s y^T) H_k (I - rho y s^T) + rho s s^T
+            # Compute  v = H_k y  first
+            Hy = _mat_vec(H, y)
+            # Build rank-2 update directly
+            # H_new = H - rho*(H*y*s^T + s*y^T*H) + rho*(s^T*H*y + 1)*s*s^T
+            yTHy = _dot(y, Hy)
+            # H_{k+1}[i][j] = H[i][j]
+            #   - rho*(Hy[i]*s[j] + s[i]*Hy[j])      [symmetrised cross terms]
+            #   + rho*(rho*yTHy + 1)*s[i]*s[j]
+            H_new = [
+                [
+                    H[i][j]
+                    - rho * (Hy[i] * s[j] + s[i] * Hy[j])
+                    + rho * (rho * yTHy + 1.0) * s[i] * s[j]
+                    for j in range(n)
+                ]
+                for i in range(n)
+            ]
+            H = H_new
+
+        x = x_new
+        g = g_new
+
+    return x, f(x), k + 1, converged
+
+
+# ---------------------------------------------------------------------------
+# 3. L-BFGS
+# ---------------------------------------------------------------------------
+
+def lbfgs(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    x0: List[float],
+    m: int = 10,
+    tol: float = 1e-6,
+    max_iter: int = 200,
+) -> Tuple[List[float], float, int, bool]:
+    """Limited-memory BFGS.
+
+    Stores the last ``m`` curvature pairs (s_k, y_k) and applies the
+    two-loop recursion to compute the search direction  d = -H_k g  without
+    ever forming H_k explicitly.
+
+    Parameters
+    ----------
+    f, grad_f, x0:
+        See ``bfgs``.
+    m:
+        History size (default ``10``).
+    tol, max_iter:
+        See ``newton_raphson``.
+
+    Returns
+    -------
+    (x_opt, f_opt, n_iters, converged)
     """
+    x = x0[:]
+    g = grad_f(x)
+    converged = False
 
-    def __init__(self, max_iter: int = 100, tol: float = 1e-6):
-        self.max_iter = max_iter
-        self.tol = tol
+    # History stored as plain lists (we rotate manually)
+    s_hist: List[List[float]] = []
+    y_hist: List[List[float]] = []
+    rho_hist: List[float] = []
 
-    def optimize(
-        self,
-        f: Callable[[List[float]], float],
-        grad_f: Callable[[List[float]], List[float]],
-        x0: List[float]
-    ) -> Tuple[List[float], List[float]]:
-        """Minimize using BFGS."""
-        n = len(x0)
-        x = x0[:]
+    for k in range(max_iter):
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
 
-        # Initialize inverse Hessian approximation as identity
-        H_inv = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+        # Two-loop recursion
+        q = g[:]
+        alphas = []
+        hist_len = len(s_hist)
+        for i in range(hist_len - 1, -1, -1):
+            ai = rho_hist[i] * _dot(s_hist[i], q)
+            alphas.append(ai)
+            q = _vec_sub(q, _vec_scale(y_hist[i], ai))
+        alphas.reverse()
 
-        grad = grad_f(x)
-        history = [f(x)]
-
-        for iteration in range(self.max_iter):
-            # Check convergence
-            grad_norm = math.sqrt(sum(g**2 for g in grad))
-            if grad_norm < self.tol:
-                break
-
-            # Compute search direction
-            direction = [-sum(H_inv[i][j] * grad[j] for j in range(n)) for i in range(n)]
-
-            # Line search (simplified - use fixed step)
-            alpha = self._line_search(f, x, direction, grad)
-
-            # Update x
-            x_new = [xi + alpha * di for xi, di in zip(x, direction)]
-
-            # Compute gradient at new point
-            grad_new = grad_f(x_new)
-
-            # BFGS update
-            s = [alpha * di for di in direction]  # x_new - x
-            y = [grad_new[i] - grad[i] for i in range(n)]
-
-            # Update inverse Hessian approximation
-            H_inv = self._bfgs_update(H_inv, s, y)
-
-            x = x_new
-            grad = grad_new
-            history.append(f(x))
-
-        return x, history
-
-    def _line_search(self, f, x, direction, grad):
-        """Delegate to shared second-order backtracking line search."""
-        return _so_line_search(f, x, direction, grad)
-
-    def reset(self):
-        """No persistent state between optimize() calls; provided for API consistency."""
-        pass
-
-    def _bfgs_update(self, H_inv, s, y):
-        """BFGS update formula for inverse Hessian."""
-        n = len(s)
-
-        # Compute s^T y
-        s_dot_y = sum(s[i] * y[i] for i in range(n))
-
-        # Curvature condition: s·y must be strictly positive for H_inv to remain PD.
-        # Using abs() previously allowed negative s·y to corrupt the approximation.
-        if s_dot_y <= 1e-10:
-            return H_inv  # Skip update
-
-        # Compute H_inv * y
-        Hy = [sum(H_inv[i][j] * y[j] for j in range(n)) for i in range(n)]
-
-        # Compute y^T * H_inv * y
-        y_H_y = sum(y[i] * Hy[i] for i in range(n))
-
-        # BFGS update
-        rho = 1.0 / s_dot_y
-
-        H_new = [[0.0] * n for _ in range(n)]
-        for i in range(n):
-            for j in range(n):
-                term1 = H_inv[i][j]
-                term2 = rho * s[i] * s[j] * (1 + rho * y_H_y)
-                term3 = rho * (Hy[i] * s[j] + s[i] * Hy[j])
-                H_new[i][j] = term1 + term2 - term3
-
-        return H_new
-
-
-class LBFGS:
-    """
-    Limited-memory BFGS.
-
-    Memory-efficient version of BFGS for large-scale problems.
-    Stores only recent updates instead of full Hessian approximation.
-    """
-
-    def __init__(self, m: int = 10, max_iter: int = 100, tol: float = 1e-6):
-        """
-        Args:
-            m: Number of correction pairs to store
-            max_iter: Maximum iterations
-            tol: Tolerance
-        """
-        self.m = m
-        self.max_iter = max_iter
-        self.tol = tol
-
-    def optimize(
-        self,
-        f: Callable[[List[float]], float],
-        grad_f: Callable[[List[float]], List[float]],
-        x0: List[float]
-    ) -> Tuple[List[float], List[float]]:
-        """Minimize using L-BFGS."""
-        x = x0[:]
-        grad = grad_f(x)
-        history = [f(x)]
-
-        # Use deque with maxlen for O(1) eviction of oldest pairs (fixes QUALITY-003).
-        s_list: deque = deque(maxlen=self.m)  # s_k = x_{k+1} - x_k
-        y_list: deque = deque(maxlen=self.m)  # y_k = grad_{k+1} - grad_k
-
-        for iteration in range(self.max_iter):
-            # Check convergence
-            grad_norm = math.sqrt(sum(g**2 for g in grad))
-            if grad_norm < self.tol:
-                break
-
-            # Compute search direction using two-loop recursion
-            direction = self._two_loop_recursion(grad, s_list, y_list)
-
-            # Line search
-            alpha = self._line_search(f, x, direction, grad)
-
-            # Update
-            x_new = [xi + alpha * di for xi, di in zip(x, direction)]
-            grad_new = grad_f(x_new)
-
-            # Store correction pair only when curvature condition s·y > 0 holds.
-            # Negative or zero curvature would corrupt the two-loop recursion.
-            s = [x_new[i] - x[i] for i in range(len(x))]
-            y = [grad_new[i] - grad[i] for i in range(len(grad))]
-            s_dot_y = sum(s[j] * y[j] for j in range(len(s)))
-            if s_dot_y > 1e-10:
-                # deque(maxlen=m) automatically evicts the oldest pair; no pop(0) needed
-                s_list.append(s)
-                y_list.append(y)
-
-            x = x_new
-            grad = grad_new
-            history.append(f(x))
-
-        return x, history
-
-    def _two_loop_recursion(self, grad, s_list, y_list):
-        """L-BFGS two-loop recursion."""
-        q = grad[:]
-        n = len(q)
-        m = len(s_list)
-
-        alpha_list = []
-
-        # First loop (backward)
-        for i in range(m - 1, -1, -1):
-            s_dot_y = sum(s_list[i][j] * y_list[i][j] for j in range(n))
-            if abs(s_dot_y) < 1e-10:
-                alpha_i = 0.0
-            else:
-                rho_i = 1.0 / s_dot_y
-                alpha_i = rho_i * sum(s_list[i][j] * q[j] for j in range(n))
-                q = [q[j] - alpha_i * y_list[i][j] for j in range(n)]
-            alpha_list.append(alpha_i)
-
-        # Scaling
-        if m > 0:
-            s_dot_y = sum(s_list[-1][j] * y_list[-1][j] for j in range(n))
-            y_dot_y = sum(y_list[-1][j] * y_list[-1][j] for j in range(n))
-            if abs(y_dot_y) > 1e-10:
-                gamma = s_dot_y / y_dot_y
-                r = [gamma * q[j] for j in range(n)]
-            else:
-                r = q
+        # Initial Hessian scaling: gamma = s_{k-1}^T y_{k-1} / y_{k-1}^T y_{k-1}
+        if hist_len > 0:
+            sy = _dot(s_hist[-1], y_hist[-1])
+            yy = _dot(y_hist[-1], y_hist[-1])
+            gamma = sy / yy if yy > 1e-15 else 1.0
         else:
-            r = q
+            gamma = 1.0
 
-        # Second loop (forward)
-        alpha_list.reverse()
-        for i in range(m):
-            s_dot_y = sum(s_list[i][j] * y_list[i][j] for j in range(n))
-            if abs(s_dot_y) < 1e-10:
+        r = _vec_scale(q, gamma)
+
+        for i in range(hist_len):
+            beta = rho_hist[i] * _dot(y_hist[i], r)
+            r = _vec_add(r, _vec_scale(s_hist[i], alphas[i] - beta))
+
+        d = [-ri for ri in r]  # search direction
+
+        # Ensure descent
+        if _dot(d, g) >= 0:
+            d = [-gi for gi in g]
+
+        # Backtracking line search
+        step = _backtracking(f, x, d, g)
+
+        x_new = _vec_add(x, _vec_scale(d, step))
+        g_new = grad_f(x_new)
+
+        s = _vec_sub(x_new, x)
+        y = _vec_sub(g_new, g)
+        sy = _dot(s, y)
+
+        if sy > 1e-10:
+            if len(s_hist) >= m:
+                s_hist.pop(0)
+                y_hist.pop(0)
+                rho_hist.pop(0)
+            s_hist.append(s)
+            y_hist.append(y)
+            rho_hist.append(1.0 / sy)
+
+        x = x_new
+        g = g_new
+
+    return x, f(x), k + 1, converged
+
+
+# ---------------------------------------------------------------------------
+# 4. SR1
+# ---------------------------------------------------------------------------
+
+def sr1(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    x0: List[float],
+    tol: float = 1e-6,
+    max_iter: int = 200,
+    r: float = 1e-8,
+) -> Tuple[List[float], float, int, bool]:
+    """Symmetric Rank-1 quasi-Newton (inverse Hessian form).
+
+    The SR1 update for the inverse Hessian approximation H_k is:
+
+    .. math::
+        H_{k+1} = H_k + \\frac{(s - H y)(s - H y)^T}{(s - H y)^T y}
+
+    The update is skipped when the denominator is small relative to the
+    norms involved (safeguard controlled by ``r``).
+
+    Parameters
+    ----------
+    r:
+        Skip-update threshold: update is skipped when
+        ``|(s - H y)^T y| < r * ||s - H y|| * ||y||`` (default ``1e-8``).
+
+    Returns
+    -------
+    (x_opt, f_opt, n_iters, converged)
+    """
+    n = len(x0)
+    x = x0[:]
+    g = grad_f(x)
+    H = _eye(n)  # inverse Hessian approximation
+    converged = False
+
+    for k in range(max_iter):
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
+
+        d = _mat_vec(H, [-gi for gi in g])
+
+        # Ensure descent
+        if _dot(d, g) >= 0:
+            d = [-gi for gi in g]
+
+        step = _backtracking(f, x, d, g)
+
+        x_new = _vec_add(x, _vec_scale(d, step))
+        g_new = grad_f(x_new)
+
+        s = _vec_sub(x_new, x)
+        y = _vec_sub(g_new, g)
+
+        # SR1 inverse Hessian update
+        Hy = _mat_vec(H, y)
+        v = _vec_sub(s, Hy)               # s - H y
+        denom = _dot(v, y)                  # (s - H y)^T y
+        v_norm = _norm(v)
+        y_norm = _norm(y)
+        # Skip if denominator is too small
+        if abs(denom) >= r * v_norm * y_norm and abs(denom) > 1e-15:
+            scale = 1.0 / denom
+            # H_{k+1} = H_k + scale * v v^T
+            for i in range(n):
+                for j in range(n):
+                    H[i][j] += scale * v[i] * v[j]
+
+        x = x_new
+        g = g_new
+
+    return x, f(x), k + 1, converged
+
+
+# ---------------------------------------------------------------------------
+# 5. Gauss-Newton
+# ---------------------------------------------------------------------------
+
+def gauss_newton(
+    residuals_f: Callable[[List[float]], List[float]],
+    jacobian_f: Callable[[List[float]], List[List[float]]],
+    x0: List[float],
+    tol: float = 1e-6,
+    max_iter: int = 100,
+) -> Tuple[List[float], float, int, bool]:
+    """Gauss-Newton method for nonlinear least-squares.
+
+    Minimises  ``0.5 * ||r(x)||^2``  by iterating the linearised subproblem:
+
+    .. math::
+        (J^T J) d = -J^T r
+
+    Parameters
+    ----------
+    residuals_f:
+        Callable ``r(x) -> List[float]`` returning the residual vector.
+    jacobian_f:
+        Callable ``J(x) -> List[List[float]]`` returning the m×n Jacobian.
+    x0:
+        Initial point (length n).
+    tol:
+        Convergence tolerance on ``||J^T r||`` (default ``1e-6``).
+    max_iter:
+        Maximum number of iterations (default ``100``).
+
+    Returns
+    -------
+    x_opt:
+        Approximate minimiser.
+    residual_norm:
+        ``||r(x_opt)||`` at termination.
+    n_iters:
+        Number of iterations performed.
+    converged:
+        ``True`` if ``||J^T r|| < tol`` at termination.
+    """
+    x = x0[:]
+    n = len(x)
+    converged = False
+
+    for k in range(max_iter):
+        r = residuals_f(x)
+        J = jacobian_f(x)   # m x n
+
+        # J^T r
+        JTr = [sum(J[i][j] * r[i] for i in range(len(r))) for j in range(n)]
+        grad_norm = _norm(JTr)
+        if grad_norm < tol:
+            converged = True
+            break
+
+        # J^T J  (n x n)
+        JTJ = [[sum(J[i][row] * J[i][col] for i in range(len(r)))
+                 for col in range(n)] for row in range(n)]
+
+        neg_JTr = [-v for v in JTr]
+        try:
+            d = _solve_linear(JTJ, neg_JTr)
+        except Exception:
+            warnings.warn("Gauss-Newton: singular J^T J; stopping.")
+            break
+
+        # Simple backtracking on ||r||^2
+        f_ls = lambda z: sum(ri * ri for ri in residuals_f(z))
+        g_ls = [2 * v for v in JTr]
+        step = _backtracking(f_ls, x, d, g_ls)
+
+        x = _vec_add(x, _vec_scale(d, step))
+
+    r_final = residuals_f(x)
+    return x, _norm(r_final), k + 1, converged
+
+
+# ---------------------------------------------------------------------------
+# 6. Levenberg-Marquardt
+# ---------------------------------------------------------------------------
+
+def levenberg_marquardt(
+    residuals_f: Callable[[List[float]], List[float]],
+    jacobian_f: Callable[[List[float]], List[List[float]]],
+    x0: List[float],
+    lam: float = 1.0,
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    lam_factor: float = 10.0,
+) -> Tuple[List[float], float, int, bool]:
+    """Levenberg-Marquardt algorithm for nonlinear least-squares.
+
+    Solves a damped linear system at each iteration:
+
+    .. math::
+        (J^T J + \\lambda I) d = -J^T r
+
+    ``lambda`` is increased when a trial step fails to reduce the residual
+    norm and decreased on success, providing an interpolation between
+    Gauss-Newton (small λ) and steepest descent (large λ).
+
+    Parameters
+    ----------
+    lam:
+        Initial damping parameter (default ``1.0``).
+    lam_factor:
+        Multiplicative factor for adapting λ (default ``10.0``).
+
+    Returns
+    -------
+    (x_opt, residual_norm, n_iters, converged)
+    """
+    x = x0[:]
+    n = len(x)
+    converged = False
+
+    for k in range(max_iter):
+        r = residuals_f(x)
+        J = jacobian_f(x)   # m x n
+        m_res = len(r)
+
+        JTr = [sum(J[i][j] * r[i] for i in range(m_res)) for j in range(n)]
+        grad_norm = _norm(JTr)
+        if grad_norm < tol:
+            converged = True
+            break
+
+        JTJ = [[sum(J[i][row] * J[i][col] for i in range(m_res))
+                 for col in range(n)] for row in range(n)]
+
+        # Damped system: (J^T J + lam * I) d = -J^T r
+        for _ in range(50):   # try increasing lam until system is solvable
+            JTJ_lam = [[JTJ[i][j] + (lam if i == j else 0.0) for j in range(n)]
+                        for i in range(n)]
+            neg_JTr = [-v for v in JTr]
+            try:
+                d = _solve_linear(JTJ_lam, neg_JTr)
+            except Exception:
+                lam *= lam_factor
                 continue
-            rho_i = 1.0 / s_dot_y
-            beta = rho_i * sum(y_list[i][j] * r[j] for j in range(n))
-            r = [r[j] + s_list[i][j] * (alpha_list[i] - beta) for j in range(n)]
 
-        return [-ri for ri in r]
+            x_new = _vec_add(x, d)
+            r_new = residuals_f(x_new)
+            cost_old = sum(ri * ri for ri in r)
+            cost_new = sum(ri * ri for ri in r_new)
 
-    def _line_search(self, f, x, direction, grad):
-        """Delegate to shared second-order backtracking line search."""
-        return _so_line_search(f, x, direction, grad)
-
-    def reset(self):
-        """No persistent state between optimize() calls; provided for API consistency."""
-        pass
-
-
-class ConjugateGradient:
-    """
-    Conjugate Gradient method.
-
-    Efficient for quadratic functions, extends to non-quadratic via
-    nonlinear conjugate gradient.
-    """
-
-    def __init__(self, max_iter: int = 100, tol: float = 1e-6):
-        self.max_iter = max_iter
-        self.tol = tol
-
-    def optimize(
-        self,
-        f: Callable[[List[float]], float],
-        grad_f: Callable[[List[float]], List[float]],
-        x0: List[float]
-    ) -> Tuple[List[float], List[float]]:
-        """Minimize using Conjugate Gradient."""
-        x = x0[:]
-        grad = grad_f(x)
-        direction = [-g for g in grad]  # Initial direction: steepest descent
-        history = [f(x)]
-
-        for iteration in range(self.max_iter):
-            # Check convergence
-            grad_norm = math.sqrt(sum(g**2 for g in grad))
-            if grad_norm < self.tol:
+            if cost_new < cost_old:
+                x = x_new
+                lam = max(lam / lam_factor, 1e-15)
                 break
-
-            # Line search
-            alpha = self._line_search(f, x, direction, grad)
-
-            # Update x
-            x = [xi + alpha * di for xi, di in zip(x, direction)]
-
-            # New gradient
-            grad_new = grad_f(x)
-
-            # Compute beta (Fletcher-Reeves)
-            grad_norm_new_sq = sum(g**2 for g in grad_new)
-            grad_norm_sq = sum(g**2 for g in grad)
-
-            if abs(grad_norm_sq) > 1e-10:
-                beta = grad_norm_new_sq / grad_norm_sq
             else:
-                beta = 0.0
+                lam *= lam_factor
+        else:
+            # Lam blew up without progress; accept last d anyway to avoid stall
+            pass
 
-            # Periodic restart every n steps (Powell's criterion): reset to
-            # steepest descent to prevent non-conjugate direction accumulation
-            # on non-quadratic objectives.
-            if (iteration + 1) % len(x0) == 0:
-                beta = 0.0
+    r_final = residuals_f(x)
+    return x, _norm(r_final), k + 1, converged
 
-            # Update direction
-            direction = [-g + beta * d for g, d in zip(grad_new, direction)]
 
-            grad = grad_new
-            history.append(f(x))
+# ---------------------------------------------------------------------------
+# 7. Trust-Region (Steihaug CG subproblem)
+# ---------------------------------------------------------------------------
 
-        return x, history
+def _steihaug_cg(
+    g: List[float],
+    H: List[List[float]],
+    delta: float,
+    tol: float = 1e-10,
+    max_cg: int = 200,
+) -> List[float]:
+    """Steihaug truncated CG for the trust-region subproblem.
 
-    def _line_search(self, f, x, direction, grad):
-        """Delegate to shared second-order backtracking line search."""
-        return _so_line_search(f, x, direction, grad)
+    Minimise  m(d) = g^T d + 0.5 d^T H d  subject to  ||d|| <= delta.
 
-    def reset(self):
-        """No persistent state between optimize() calls; provided for API consistency."""
-        pass
+    Returns the step d.
+    """
+    n = len(g)
+    d = [0.0] * n
+    r = g[:]          # residual = g + H d = g when d=0
+    p = [-ri for ri in r]  # search direction
+
+    r_norm_sq = _dot(r, r)
+    if math.sqrt(r_norm_sq) < tol:
+        return d
+
+    for _ in range(max_cg):
+        Hp = _mat_vec(H, p)
+        pHp = _dot(p, Hp)
+
+        if pHp <= 0:
+            # Negative curvature: go to boundary
+            # Solve ||d + tau*p||^2 = delta^2 for tau
+            d_norm_sq = _dot(d, d)
+            dp = _dot(d, p)
+            p_norm_sq = _dot(p, p)
+            discriminant = dp * dp - p_norm_sq * (d_norm_sq - delta * delta)
+            tau = (-dp + math.sqrt(max(0.0, discriminant))) / p_norm_sq
+            return _vec_add(d, _vec_scale(p, tau))
+
+        alpha = r_norm_sq / pHp
+        d_new = _vec_add(d, _vec_scale(p, alpha))
+
+        if _norm(d_new) >= delta:
+            # Hit boundary: go to boundary
+            d_norm_sq = _dot(d, d)
+            dp = _dot(d, p)
+            p_norm_sq = _dot(p, p)
+            discriminant = dp * dp - p_norm_sq * (d_norm_sq - delta * delta)
+            tau = (-dp + math.sqrt(max(0.0, discriminant))) / p_norm_sq
+            return _vec_add(d, _vec_scale(p, tau))
+
+        d = d_new
+        r_new = _vec_add(r, _vec_scale(Hp, alpha))
+        r_norm_sq_new = _dot(r_new, r_new)
+
+        if math.sqrt(r_norm_sq_new) < tol:
+            return d
+
+        beta = r_norm_sq_new / r_norm_sq
+        p = _vec_add([-ri for ri in r_new], _vec_scale(p, beta))
+        r = r_new
+        r_norm_sq = r_norm_sq_new
+
+    return d
+
+
+def trust_region(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    hess_f: Callable[[List[float]], List[List[float]]],
+    x0: List[float],
+    delta0: float = 1.0,
+    delta_max: float = 100.0,
+    eta: float = 0.125,
+    tol: float = 1e-6,
+    max_iter: int = 100,
+) -> Tuple[List[float], float, int, bool]:
+    """Trust-region method with Steihaug CG subproblem solver.
+
+    At each iteration the algorithm:
+
+    1. Solves the trust-region subproblem approximately using Steihaug CG.
+    2. Computes the ratio  ρ = (f(x) - f(x+d)) / (m(0) - m(d)),
+       where m(d) = f + g^T d + 0.5 d^T H d is the quadratic model.
+    3. Accepts or rejects the step and updates the trust-region radius δ.
+
+    Parameters
+    ----------
+    delta0:
+        Initial trust-region radius (default ``1.0``).
+    delta_max:
+        Maximum trust-region radius (default ``100.0``).
+    eta:
+        Minimum acceptable ratio for step acceptance (default ``0.125``).
+
+    Returns
+    -------
+    (x_opt, f_opt, n_iters, converged)
+    """
+    x = x0[:]
+    delta = delta0
+    converged = False
+
+    for k in range(max_iter):
+        g = grad_f(x)
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
+
+        H = hess_f(x)
+        d = _steihaug_cg(g, H, delta)
+
+        f_x = f(x)
+        f_xd = f(_vec_add(x, d))
+
+        # Actual reduction
+        actual = f_x - f_xd
+        # Predicted reduction from quadratic model: -(g^T d + 0.5 d^T H d)
+        Hd = _mat_vec(H, d)
+        predicted = -((_dot(g, d) + 0.5 * _dot(d, Hd)))
+
+        if abs(predicted) < 1e-15:
+            rho = 1.0 if actual >= 0 else 0.0
+        else:
+            rho = actual / predicted
+
+        # Update trust radius
+        d_norm = _norm(d)
+        if rho < 0.25:
+            delta = 0.25 * d_norm
+            delta = max(delta, 1e-10)
+        elif rho > 0.75 and abs(d_norm - delta) < 1e-10:
+            delta = min(2.0 * delta, delta_max)
+
+        # Accept or reject step
+        if rho > eta:
+            x = _vec_add(x, d)
+
+    return x, f(x), k + 1, converged
+
+
+# ---------------------------------------------------------------------------
+# 8. Newton-CG (Truncated Newton)
+# ---------------------------------------------------------------------------
+
+def newton_cg(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    hess_f: Callable[[List[float]], List[List[float]]],
+    x0: List[float],
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    cg_tol: float = 0.5,
+) -> Tuple[List[float], float, int, bool]:
+    """Newton-CG (truncated Newton) optimisation.
+
+    Uses the conjugate gradient method to *approximately* solve the Newton
+    system  H d = -g  at each outer iteration.  The CG solver terminates
+    when the residual norm satisfies the forcing-sequence condition:
+
+    .. math::
+        ||r|| \\le \\min(cg\\_tol,\\, \\sqrt{||g||}) \\cdot ||g||
+
+    This avoids over-solving and is appropriate for inexact Newton methods.
+    A backtracking line search is used on the resulting direction.
+
+    Parameters
+    ----------
+    cg_tol:
+        Coefficient in the forcing sequence (default ``0.5``).
+
+    Returns
+    -------
+    (x_opt, f_opt, n_iters, converged)
+    """
+    x = x0[:]
+    converged = False
+
+    for k in range(max_iter):
+        g = grad_f(x)
+        g_norm = _norm(g)
+        if g_norm < tol:
+            converged = True
+            break
+
+        H = hess_f(x)
+        n = len(x)
+
+        # CG stopping tolerance (forcing sequence)
+        eta_k = min(cg_tol, math.sqrt(g_norm)) * g_norm
+
+        # CG to solve H d = -g
+        d = [0.0] * n
+        r = g[:]            # residual r = g + H*0 = g
+        p = [-ri for ri in r]
+        r_norm_sq = _dot(r, r)
+
+        for _ in range(n * 2 + 10):
+            if math.sqrt(r_norm_sq) <= eta_k:
+                break
+            Hp = _mat_vec(H, p)
+            pHp = _dot(p, Hp)
+            if pHp <= 0:
+                # Negative curvature: use steepest-descent as fallback
+                if _norm(d) < 1e-12:
+                    d = [-gi for gi in g]
+                break
+            alpha_cg = r_norm_sq / pHp
+            d = _vec_add(d, _vec_scale(p, alpha_cg))
+            r = _vec_add(r, _vec_scale(Hp, alpha_cg))
+            r_norm_sq_new = _dot(r, r)
+            beta = r_norm_sq_new / r_norm_sq
+            p = _vec_add([-ri for ri in r], _vec_scale(p, beta))
+            r_norm_sq = r_norm_sq_new
+
+        # Ensure d is a descent direction
+        if _dot(d, g) >= 0:
+            d = [-gi for gi in g]
+
+        # Backtracking line search
+        step = _backtracking(f, x, d, g)
+        x = _vec_add(x, _vec_scale(d, step))
+
+    return x, f(x), k + 1, converged
