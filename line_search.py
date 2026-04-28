@@ -1,315 +1,519 @@
 """
-Line Search Methods
-===================
+line_search.py — Line search methods for optimization.
 
-Line search algorithms for determining optimal step size.
+Pure Python (stdlib only: math, typing).
 
-Applications:
-- Newton's method and quasi-Newton methods
-- Trust region methods
-- Conjugate gradient
+All vector operations work on List[float].
 """
 
 import math
-from typing import Callable, Tuple, Optional, List
+from typing import Callable, List, Tuple
+
+__all__ = [
+    'backtracking_line_search',
+    'wolfe_line_search',
+    'brent_minimize',
+    'cubic_interpolation_line_search',
+    'strong_wolfe_line_search',
+]
 
 
-def armijo_condition(
-    f: Callable[[List[float]], float],
-    x: List[float],
-    direction: List[float],
-    gradient: List[float],
-    alpha: float,
-    c1: float = 1e-4
-) -> bool:
-    """
-    Check Armijo condition (sufficient decrease).
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    f(x + α*d) ≤ f(x) + c₁*α*∇f(x)ᵀd
+def _dot(u: List[float], v: List[float]) -> float:
+    """Dot product of two vectors."""
+    return sum(ui * vi for ui, vi in zip(u, v))
 
-    Args:
-        f: Objective function
-        x: Current point
-        direction: Search direction
-        gradient: Gradient at x
-        alpha: Step size to check
-        c1: Armijo constant (typically 1e-4)
 
-    Returns:
-        True if Armijo condition satisfied
-    """
-    # Compute x + alpha * direction
-    x_new = [xi + alpha * di for xi, di in zip(x, direction)]
+def _axpy(alpha: float, x: List[float], y: List[float]) -> List[float]:
+    """Return alpha*x + y (BLAS axpy style)."""
+    return [alpha * xi + yi for xi, yi in zip(x, y)]
 
-    # Left side: f(x_new)
-    f_new = f(x_new)
 
-    # Right side: f(x) + c1 * alpha * grad^T * direction
-    grad_dot_dir = sum(gi * di for gi, di in zip(gradient, direction))
-    f_expected = f(x) + c1 * alpha * grad_dot_dir
-
-    return f_new <= f_expected
-
+# ---------------------------------------------------------------------------
+# 1. Backtracking line search (Armijo condition)
+# ---------------------------------------------------------------------------
 
 def backtracking_line_search(
     f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
     x: List[float],
     direction: List[float],
-    gradient: List[float],
-    alpha_init: float = 1.0,
+    alpha0: float = 1.0,
     rho: float = 0.5,
-    c1: float = 1e-4,
-    max_iter: int = 50
+    c: float = 1e-4,
+    max_iter: int = 50,
 ) -> float:
+    """Backtracking line search satisfying the Armijo sufficient-decrease condition.
+
+    Starts from ``alpha0`` and repeatedly multiplies by ``rho`` until
+
+        f(x + alpha * direction) <= f(x) + c * alpha * dot(grad_f(x), direction)
+
+    or ``max_iter`` reductions have been performed.
+
+    Parameters
+    ----------
+    f:
+        Objective function ``f(x) -> float``.
+    grad_f:
+        Gradient ``grad_f(x) -> List[float]``.
+    x:
+        Current iterate (List[float]).
+    direction:
+        Search direction (List[float]).  Should satisfy dot(grad_f(x), direction) < 0
+        for a descent direction.
+    alpha0:
+        Initial step size (default 1.0).
+    rho:
+        Contraction factor in (0, 1) (default 0.5).
+    c:
+        Armijo constant, typically 1e-4 (default 1e-4).
+    max_iter:
+        Maximum number of contractions (default 50).
+
+    Returns
+    -------
+    float
+        Step size satisfying the Armijo condition, or the smallest alpha tried
+        if the condition is never met.
     """
-    Backtracking line search satisfying Armijo condition.
+    f0 = f(x)
+    g0 = grad_f(x)
+    slope = _dot(g0, direction)
 
-    Starts with alpha_init and reduces by factor rho until
-    Armijo condition is satisfied.
-
-    Args:
-        f: Objective function
-        x: Current point
-        direction: Search direction (typically -gradient or Newton direction)
-        gradient: Gradient at x
-        alpha_init: Initial step size
-        rho: Reduction factor (0 < rho < 1)
-        c1: Armijo constant
-        max_iter: Maximum iterations
-
-    Returns:
-        Step size alpha
-
-    Example:
-        >>> f = lambda x: sum(xi**2 for xi in x)
-        >>> x = [1.0, 2.0]
-        >>> grad = [2.0, 4.0]
-        >>> direction = [-g for g in grad]
-        >>> alpha = backtracking_line_search(f, x, direction, grad)
-    """
-    alpha = alpha_init
-
+    alpha = alpha0
     for _ in range(max_iter):
-        if armijo_condition(f, x, direction, gradient, alpha, c1):
+        x_new = _axpy(alpha, direction, x)
+        if f(x_new) <= f0 + c * alpha * slope:
             return alpha
         alpha *= rho
 
     return alpha
 
 
-def wolfe_conditions(
-    f: Callable[[List[float]], float],
-    grad_f: Callable[[List[float]], List[float]],
-    x: List[float],
-    direction: List[float],
-    gradient: List[float],
-    alpha: float,
-    c1: float = 1e-4,
-    c2: float = 0.9
-) -> bool:
-    """
-    Check Wolfe conditions (sufficient decrease + curvature).
-
-    Condition 1 (Armijo): f(x + α*d) ≤ f(x) + c₁*α*∇f(x)ᵀd
-    Condition 2 (Curvature): ∇f(x + α*d)ᵀd ≥ c₂*∇f(x)ᵀd
-
-    Args:
-        f: Objective function
-        grad_f: Gradient function
-        x: Current point
-        direction: Search direction
-        gradient: Gradient at x
-        alpha: Step size
-        c1: Armijo constant
-        c2: Curvature constant
-
-    Returns:
-        True if both Wolfe conditions satisfied
-    """
-    # Check Armijo condition
-    if not armijo_condition(f, x, direction, gradient, alpha, c1):
-        return False
-
-    # Compute new point
-    x_new = [xi + alpha * di for xi, di in zip(x, direction)]
-
-    # Compute new gradient
-    grad_new = grad_f(x_new)
-
-    # Check curvature condition
-    grad_dot_dir = sum(gi * di for gi, di in zip(gradient, direction))
-    grad_new_dot_dir = sum(gi * di for gi, di in zip(grad_new, direction))
-
-    return grad_new_dot_dir >= c2 * grad_dot_dir
-
+# ---------------------------------------------------------------------------
+# 2. Basic Wolfe line search (bracket + bisection)
+# ---------------------------------------------------------------------------
 
 def wolfe_line_search(
     f: Callable[[List[float]], float],
     grad_f: Callable[[List[float]], List[float]],
     x: List[float],
     direction: List[float],
-    gradient: List[float],
-    alpha_init: float = 1.0,
+    alpha0: float = 1.0,
     c1: float = 1e-4,
     c2: float = 0.9,
-    max_iter: int = 20
+    max_iter: int = 20,
 ) -> float:
+    """Line search satisfying the (weak) Wolfe conditions.
+
+    The two Wolfe conditions are:
+
+    * **Armijo** (sufficient decrease):
+      ``phi(alpha) <= phi(0) + c1 * alpha * phi'(0)``
+    * **Curvature**:
+      ``phi'(alpha) >= c2 * phi'(0)``
+
+    Uses a bracket-then-bisection strategy.
+
+    Parameters
+    ----------
+    f:
+        Objective function.
+    grad_f:
+        Gradient function.
+    x:
+        Current iterate.
+    direction:
+        Search direction (should be a descent direction).
+    alpha0:
+        Initial trial step (default 1.0).
+    c1:
+        Armijo constant (default 1e-4).
+    c2:
+        Curvature constant, 0 < c1 < c2 < 1 (default 0.9).
+    max_iter:
+        Maximum iterations (default 20).
+
+    Returns
+    -------
+    float
+        Step size approximately satisfying Wolfe conditions.
     """
-    Line search satisfying Wolfe conditions.
+    phi0 = f(x)
+    dphi0 = _dot(grad_f(x), direction)  # phi'(0)
 
-    Uses bracketing and zoom procedure.
+    def phi(a: float) -> float:
+        return f(_axpy(a, direction, x))
 
-    Args:
-        f: Objective function
-        grad_f: Gradient function
-        x: Current point
-        direction: Search direction
-        gradient: Gradient at x
-        alpha_init: Initial step size
-        c1: Armijo constant
-        c2: Curvature constant
-        max_iter: Maximum iterations
+    def dphi(a: float) -> float:
+        return _dot(grad_f(_axpy(a, direction, x)), direction)
 
-    Returns:
-        Step size alpha
-
-    Example:
-        >>> f = lambda x: sum(xi**2 for xi in x)
-        >>> grad_f = lambda x: [2*xi for xi in x]
-        >>> x = [1.0, 2.0]
-        >>> direction = [-2.0, -4.0]
-        >>> grad = [2.0, 4.0]
-        >>> alpha = wolfe_line_search(f, grad_f, x, direction, grad)
-    """
-    # Bracket-and-bisect Wolfe line search.
-    # alpha_lo satisfies Armijo; alpha_hi violates it (or is the upper sentinel).
-    alpha = alpha_init
     alpha_lo = 0.0
-    alpha_hi = None          # unknown upper bound initially
-    ALPHA_MAX = 1e8          # safety cap to prevent unbounded growth
+    alpha_hi = alpha0
+    phi_lo = phi0
+    dphi_lo = dphi0
 
-    for _ in range(max_iter):
-        if wolfe_conditions(f, grad_f, x, direction, gradient, alpha, c1, c2):
+    alpha = alpha0
+
+    for i in range(max_iter):
+        phi_a = phi(alpha)
+
+        # Armijo violated → must reduce; set upper bound
+        if phi_a > phi0 + c1 * alpha * dphi0 or (i > 0 and phi_a >= phi_lo):
+            alpha_hi = alpha
+            # bisect
+            alpha = 0.5 * (alpha_lo + alpha_hi)
+            continue
+
+        dphi_a = dphi(alpha)
+
+        # Curvature condition met → done
+        if dphi_a >= c2 * dphi0:
             return alpha
 
-        if not armijo_condition(f, x, direction, gradient, alpha, c1):
-            # Armijo violated: alpha is too large; shrink the bracket
-            alpha_hi = alpha
-            alpha = (alpha_lo + alpha_hi) / 2.0
+        # Slope positive → upper bound found; zoom from below
+        alpha_lo = alpha
+        phi_lo = phi_a
+        dphi_lo = dphi_a
+
+        if alpha_hi is None or math.isinf(alpha_hi):
+            alpha = 2.0 * alpha
         else:
-            # Armijo satisfied but curvature not: need a larger alpha
-            alpha_lo = alpha
-            if alpha_hi is not None:
-                # Zoom between lo and hi
-                alpha = (alpha_lo + alpha_hi) / 2.0
-            else:
-                # No upper bound yet; double with a hard cap
-                alpha = min(alpha * 2.0, ALPHA_MAX)
-                if alpha >= ALPHA_MAX:
-                    break
+            alpha = 0.5 * (alpha_lo + alpha_hi)
 
     return alpha
 
 
-def exact_line_search_quadratic(
-    A: List[List[float]],
-    b: List[float],
-    x: List[float],
-    direction: List[float]
-) -> float:
-    """
-    Exact line search for quadratic function.
+# ---------------------------------------------------------------------------
+# 3. Brent's method for scalar minimization
+# ---------------------------------------------------------------------------
 
-    For f(x) = 0.5 * x^T A x - b^T x,
-    optimal step size is α = (r^T d) / (d^T A d)
-
-    where r = b - Ax is the residual.
-
-    Args:
-        A: Matrix in quadratic form
-        b: Vector in quadratic form
-        x: Current point
-        direction: Search direction
-
-    Returns:
-        Exact step size
-    """
-    n = len(x)
-    if len(A) != n or len(b) != n or any(len(row) != n for row in A):
-        raise ValueError(
-            f"exact_line_search_quadratic: A must be {n}×{n} and b must have "
-            f"length {n} to match x (got A: {len(A)}×{len(A[0]) if A else 0}, "
-            f"b: {len(b)})"
-        )
-
-    # Compute Ax
-    Ax = [sum(A[i][j] * x[j] for j in range(n)) for i in range(n)]
-
-    # Residual: r = b - Ax
-    r = [b[i] - Ax[i] for i in range(len(x))]
-
-    # Compute A * direction
-    Ad = [sum(A[i][j] * direction[j] for j in range(len(direction)))
-          for i in range(len(A))]
-
-    # Numerator: r^T * d
-    numerator = sum(r[i] * direction[i] for i in range(len(r)))
-
-    # Denominator: d^T * A * d
-    denominator = sum(direction[i] * Ad[i] for i in range(len(direction)))
-
-    if abs(denominator) < 1e-10:
-        return 0.0
-
-    alpha = numerator / denominator
-    # A negative alpha would move in the ascent direction; clamp to zero.
-    return max(alpha, 0.0)
-
-
-def golden_section_search(
+def brent_minimize(
     f: Callable[[float], float],
     a: float,
     b: float,
-    tol: float = 1e-5
+    tol: float = 1e-6,
+    max_iter: int = 100,
 ) -> float:
+    """Brent's method for finding the minimum of a scalar function on [a, b].
+
+    Combines golden-section search with parabolic interpolation for
+    superlinear convergence near a smooth minimum.
+
+    Parameters
+    ----------
+    f:
+        Scalar objective function ``f(x) -> float``.
+    a:
+        Left endpoint of the search interval.
+    b:
+        Right endpoint of the search interval.
+    tol:
+        Convergence tolerance (default 1e-6).
+    max_iter:
+        Maximum number of iterations (default 100).
+
+    Returns
+    -------
+    float
+        The x value (not f(x)) at the approximate minimum.
     """
-    Golden section search for 1D minimization.
+    _golden = 1.0 - (math.sqrt(5.0) - 1.0) / 2.0  # ≈ 0.381966
 
-    Finds minimum of f on interval [a, b].
+    # Initialise: x is the best point so far; w and v are the two next best.
+    x = w = v = a + _golden * (b - a)
+    fx = fw = fv = f(x)
+    d = e = 0.0  # d = last step, e = step before last
 
-    Args:
-        f: Univariate function
-        a: Left endpoint
-        b: Right endpoint
-        tol: Tolerance
+    for _ in range(max_iter):
+        midpoint = 0.5 * (a + b)
+        tol1 = tol * abs(x) + 1e-10
+        tol2 = 2.0 * tol1
 
-    Returns:
-        Approximate minimizer
+        # Convergence check
+        if abs(x - midpoint) <= tol2 - 0.5 * (b - a):
+            return x
 
-    Example:
-        >>> f = lambda x: (x - 2)**2
-        >>> x_min = golden_section_search(f, 0, 5)
-        >>> # Returns value close to 2
-    """
-    if a >= b:
-        raise ValueError(
-            f"golden_section_search: require a < b, got a={a}, b={b}"
-        )
+        # Try parabolic interpolation
+        use_golden = True
+        if abs(e) > tol1:
+            # Fit parabola through x, w, v (if distinct)
+            r = (x - w) * (fx - fv)
+            q = (x - v) * (fx - fw)
+            p = (x - v) * q - (x - w) * r
+            q = 2.0 * (q - r)
+            if q > 0.0:
+                p = -p
+            else:
+                q = -q
+            r = e
+            e = d
 
-    golden_ratio = (math.sqrt(5) - 1) / 2
+            # Accept parabolic step if it lies in [a, b] and is small enough
+            if abs(p) < abs(0.5 * q * r) and p > q * (a - x) and p < q * (b - x):
+                d = p / q
+                u = x + d
+                # Don't evaluate too close to the endpoints
+                if (u - a) < tol2 or (b - u) < tol2:
+                    d = math.copysign(tol1, midpoint - x)
+                use_golden = False
 
-    # Initial points
-    c = b - golden_ratio * (b - a)
-    d = a + golden_ratio * (b - a)
+        if use_golden:
+            # Golden-section step
+            if x >= midpoint:
+                e = a - x
+            else:
+                e = b - x
+            d = _golden * e
 
-    while abs(b - a) > tol:
-        if f(c) < f(d):
-            b = d
-            d = c
-            c = b - golden_ratio * (b - a)
+        # Evaluate at new trial point u
+        u = x + (d if abs(d) >= tol1 else math.copysign(tol1, d))
+        fu = f(u)
+
+        # Update brackets and best points
+        if fu <= fx:
+            if u < x:
+                b = x
+            else:
+                a = x
+            v, fv = w, fw
+            w, fw = x, fx
+            x, fx = u, fu
         else:
-            a = c
-            c = d
-            d = a + golden_ratio * (b - a)
+            if u < x:
+                a = u
+            else:
+                b = u
+            if fu <= fw or w == x:
+                v, fv = w, fw
+                w, fw = u, fu
+            elif fu <= fv or v == x or v == w:
+                v, fv = u, fu
 
-    return (a + b) / 2
+    return x
+
+
+# ---------------------------------------------------------------------------
+# 4. Cubic interpolation line search
+# ---------------------------------------------------------------------------
+
+def cubic_interpolation_line_search(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    x: List[float],
+    direction: List[float],
+    alpha_lo: float,
+    alpha_hi: float,
+) -> float:
+    """Find a step via cubic interpolation within the bracket [alpha_lo, alpha_hi].
+
+    Uses function and directional-derivative values at both endpoints to fit
+    a cubic polynomial and return its minimiser (clamped to the bracket).
+
+    Let ``phi(alpha) = f(x + alpha * direction)``.  The cubic is fit through
+    ``(alpha_lo, phi(alpha_lo), phi'(alpha_lo))`` and
+    ``(alpha_hi, phi(alpha_hi), phi'(alpha_hi))``.
+
+    Parameters
+    ----------
+    f:
+        Objective function.
+    grad_f:
+        Gradient function.
+    x:
+        Current iterate.
+    direction:
+        Search direction.
+    alpha_lo:
+        Lower endpoint of the bracket.
+    alpha_hi:
+        Upper endpoint of the bracket.
+
+    Returns
+    -------
+    float
+        Interpolated step size, clamped to [min(alpha_lo, alpha_hi),
+        max(alpha_lo, alpha_hi)].
+    """
+    lo, hi = min(alpha_lo, alpha_hi), max(alpha_lo, alpha_hi)
+
+    x_lo = _axpy(alpha_lo, direction, x)
+    x_hi = _axpy(alpha_hi, direction, x)
+
+    phi_lo = f(x_lo)
+    phi_hi = f(x_hi)
+    d_lo = _dot(grad_f(x_lo), direction)   # phi'(alpha_lo)
+    d_hi = _dot(grad_f(x_hi), direction)   # phi'(alpha_hi)
+
+    delta = alpha_hi - alpha_lo
+
+    # Cubic minimiser formula (Nocedal & Wright, equation 3.59)
+    # Compute discriminant safely
+    s = d_lo + d_hi - 3.0 * (phi_hi - phi_lo) / delta
+    disc = s * s - d_lo * d_hi
+
+    if disc < 0.0:
+        # Imaginary roots — fall back to midpoint
+        return 0.5 * (alpha_lo + alpha_hi)
+
+    sqrt_disc = math.sqrt(disc)
+
+    # Minimiser of the cubic (Nocedal & Wright eq. 3.59)
+    denom = d_hi - d_lo + 2.0 * sqrt_disc
+    if abs(denom) < 1e-15:
+        # Degenerate cubic — fall back to midpoint
+        return 0.5 * (alpha_lo + alpha_hi)
+
+    alpha_star = alpha_hi - delta * (d_hi + sqrt_disc - s) / denom
+
+    # Clamp to bracket
+    return max(lo, min(hi, alpha_star))
+
+
+# ---------------------------------------------------------------------------
+# 5. Strong Wolfe line search (Nocedal & Wright Algorithm 3.5 / 3.6)
+# ---------------------------------------------------------------------------
+
+def strong_wolfe_line_search(
+    f: Callable[[List[float]], float],
+    grad_f: Callable[[List[float]], List[float]],
+    x: List[float],
+    direction: List[float],
+    alpha0: float = 1.0,
+    alpha_max: float = 50.0,
+    c1: float = 1e-4,
+    c2: float = 0.9,
+    max_iter: int = 20,
+) -> float:
+    """Strong Wolfe line search (Nocedal & Wright Algorithms 3.5 and 3.6).
+
+    Finds a step length satisfying the **strong** Wolfe conditions:
+
+    * **Armijo**: ``phi(alpha) <= phi(0) + c1 * alpha * phi'(0)``
+    * **Strong curvature**: ``|phi'(alpha)| <= c2 * |phi'(0)|``
+
+    The algorithm has two phases:
+
+    1. **Bracket phase**: increase alpha until a suitable bracket is found.
+    2. **Zoom phase**: bisect/interpolate within the bracket.
+
+    Parameters
+    ----------
+    f:
+        Objective function.
+    grad_f:
+        Gradient function.
+    x:
+        Current iterate.
+    direction:
+        Search direction.
+    alpha0:
+        Initial trial step (default 1.0).
+    alpha_max:
+        Maximum allowable step (default 50.0).
+    c1:
+        Armijo constant (default 1e-4).
+    c2:
+        Curvature constant, 0 < c1 < c2 < 1 (default 0.9).
+    max_iter:
+        Maximum iterations per phase (default 20).
+
+    Returns
+    -------
+    float
+        Step satisfying the strong Wolfe conditions, or the best step found.
+    """
+    def phi(a: float) -> float:
+        return f(_axpy(a, direction, x))
+
+    def dphi(a: float) -> float:
+        return _dot(grad_f(_axpy(a, direction, x)), direction)
+
+    phi0 = phi(0.0)
+    dphi0 = dphi(0.0)
+
+    # ------------------------------------------------------------------
+    # Zoom phase (Algorithm 3.6)
+    # ------------------------------------------------------------------
+    def _zoom(alpha_lo: float, alpha_hi: float, phi_lo: float, phi_hi: float) -> float:
+        """Zoom into bracket [alpha_lo, alpha_hi] to find strong-Wolfe step."""
+        for _ in range(max_iter):
+            # Try cubic interpolation, fall back to bisection
+            try:
+                alpha_j = cubic_interpolation_line_search(
+                    f, grad_f, x, direction, alpha_lo, alpha_hi
+                )
+            except Exception:
+                alpha_j = 0.5 * (alpha_lo + alpha_hi)
+
+            # Safety: if interpolation lands outside or too close to boundary, bisect
+            lo_b = min(alpha_lo, alpha_hi)
+            hi_b = max(alpha_lo, alpha_hi)
+            margin = 0.1 * (hi_b - lo_b)
+            if alpha_j <= lo_b + margin or alpha_j >= hi_b - margin:
+                alpha_j = 0.5 * (alpha_lo + alpha_hi)
+
+            phi_j = phi(alpha_j)
+
+            if phi_j > phi0 + c1 * alpha_j * dphi0 or phi_j >= phi_lo:
+                # Armijo violated or not improving — shrink from hi side
+                alpha_hi = alpha_j
+                phi_hi = phi_j
+            else:
+                dphi_j = dphi(alpha_j)
+
+                # Strong curvature condition met → done
+                if abs(dphi_j) <= c2 * abs(dphi0):
+                    return alpha_j
+
+                # Slope points toward current lo → flip hi
+                if dphi_j * (alpha_hi - alpha_lo) >= 0.0:
+                    alpha_hi = alpha_lo
+                    phi_hi = phi_lo
+
+                alpha_lo = alpha_j
+                phi_lo = phi_j
+
+            # Convergence guard
+            if abs(alpha_hi - alpha_lo) < 1e-12:
+                break
+
+        return alpha_lo
+
+    # ------------------------------------------------------------------
+    # Phase 1: bracket (Algorithm 3.5)
+    # ------------------------------------------------------------------
+    alpha_prev = 0.0
+    phi_prev = phi0
+    alpha_i = alpha0
+
+    for i in range(max_iter):
+        phi_i = phi(alpha_i)
+
+        if phi_i > phi0 + c1 * alpha_i * dphi0 or (i > 0 and phi_i >= phi_prev):
+            # Armijo violated or not improving — zoom in [alpha_prev, alpha_i]
+            return _zoom(alpha_prev, alpha_i, phi_prev, phi_i)
+
+        dphi_i = dphi(alpha_i)
+
+        # Strong curvature satisfied → done
+        if abs(dphi_i) <= c2 * abs(dphi0):
+            return alpha_i
+
+        # Positive derivative → bracket is [alpha_i, alpha_prev]; zoom
+        if dphi_i >= 0.0:
+            return _zoom(alpha_i, alpha_prev, phi_i, phi_prev)
+
+        # Continue expanding
+        alpha_prev = alpha_i
+        phi_prev = phi_i
+        alpha_i = min(2.0 * alpha_i, alpha_max)
+
+        if alpha_i >= alpha_max:
+            return alpha_i
+
+    return alpha_i
